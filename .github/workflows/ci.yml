@@ -23,10 +23,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Full pins, measured 2026-09-30: 1.19.0 is the lowest that passes.
-        # 1.18.0 fails to compile because src requires the stdlib `sync` module,
-        # which arrived in 1.19.0 — hence `crystal: ">= 1.19.0"` in shard.yml.
-        crystal: ["1.19.0", "1.20.0", "1.21.0"]
+        # Full pins: 1.19.0 is the lowest that passes (the stdlib `sync`
+        # module arrived in 1.19.0). 1.22.2 is the current local/stable
+        # toolchain and runs the format/lint/examples jobs.
+        crystal: ["1.19.0", "1.20.0", "1.21.0", "1.22.2"]
 
     steps:
       - uses: actions/checkout@v4
@@ -51,11 +51,11 @@ jobs:
       # tests the compiler rather than the code, and ameba needs a recent
       # Crystal to build at all.
       - name: Format
-        if: matrix.crystal == '1.21.0'
+        if: matrix.crystal == '1.22.2'
         run: crystal tool format --check
 
       - name: Lint
-        if: matrix.crystal == '1.21.0'
+        if: matrix.crystal == '1.22.2'
         run: shards build ameba && bin/ameba
 
       - name: Library compiles
@@ -69,7 +69,7 @@ jobs:
       # dev-only `dotenv` shard, so they only get compiled on the main line,
       # like the formatter and ameba.
       - name: Build every example
-        if: matrix.crystal == '1.21.0'
+        if: matrix.crystal == '1.22.2'
         run: |
           set -e
           for app in examples/*.cr; do

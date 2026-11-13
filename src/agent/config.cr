@@ -18,6 +18,20 @@ class Agent
     # "agent-cr:<16-char-hex>" from its own session_id.
     getter prompt_cache_key : String?
 
+    # Provider preset and resolved modern-request settings.
+    getter provider_name : String
+    getter preset : Provider::Preset
+    getter? provider_explicit : Bool
+    getter? api_key_explicit : Bool
+    getter fallbacks : Array(Config)
+    getter request_options : RequestOptions
+    getter api_style : Symbol
+    getter retry_policy : RetryPolicy
+    getter? strict_stream_end : Bool
+    getter capabilities : Provider::Capabilities
+    getter api_path : String?
+    getter query_params : Hash(String, String)
+
     # --- Per-read SSE timeout knobs ---
     # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
     # All are applied to the persistent HTTP client's per-read socket timeout.
@@ -43,9 +57,9 @@ class Agent
     getter parsed_uri : URI
 
     def initialize(
-      @api_key : String? = nil,
-      @api_endpoint : String = "https://api.openai.com/v1",
-      @model : String = "gpt-4o",
+      api_key : String? = nil,
+      api_endpoint : String? = nil,
+      model : String? = nil,
       @system_prompt : String? = nil,
       @max_tokens : Int32? = nil,
       @temperature : Float64? = nil,
@@ -56,6 +70,19 @@ class Agent
       @extra_headers : Hash(String, String)? = nil,
       @max_tool_iterations : Int32? = 100,
       @prompt_cache_key : String? = nil,
+      provider : String? = nil,
+      fallbacks : Array(Config)? = nil,
+      request_options : RequestOptions? = nil,
+      api_style : Symbol? = nil,
+      api_path : String? = nil,
+      query_params : Hash(String, String)? = nil,
+      capabilities_override : Provider::CapabilityPatch? = nil,
+      strict_stream_end : Bool? = nil,
+      retry_policy : RetryPolicy? = nil,
+      max_retries : Int32? = nil,
+      retry_backoff_base : Time::Span | Int32? = nil,
+      retry_backoff_max : Time::Span | Int32? = nil,
+      max_retry_after : Time::Span | Int32? = nil,
       *,
       first_byte_timeout_min : Time::Span | Int32 = 60,
       first_byte_timeout_max : Time::Span | Int32 = 300,
@@ -64,14 +91,69 @@ class Agent
       idle_byte_timeout : Time::Span | Int32 = 60,
       @compute_first_byte_timeout : Bool = true,
     )
+      @provider_explicit = !provider.nil?
+      @api_key_explicit = !api_key.nil?
+
+      preset = provider ? Provider::Presets.fetch(provider) : Provider::Presets.infer(api_endpoint)
+      @preset = preset
+      @provider_name = preset.name
+
+      @api_endpoint = api_endpoint || preset.default_base_url ||
+                      raise ConfigurationError.new("api_endpoint is required for provider '#{preset.name}'")
+
+      if model.nil? && preset.default_model.nil?
+        if preset.name != "custom"
+          raise ConfigurationError.new("model is required for provider '#{preset.name}'")
+        end
+        Log.warn { "No model configured for provider '#{preset.name}'; falling back to gpt-4o" }
+      end
+      @model = model || preset.default_model || "gpt-4o"
+      raise ConfigurationError.new("model must not be empty") if @model.empty?
+      if preset.name == "deepseek" && {"deepseek-chat", "deepseek-reasoner"}.includes?(@model)
+        Log.warn do
+          "DeepSeek model '#{@model}' was retired on 2026-07-24; " \
+          "use 'deepseek-flash' or 'deepseek-v4-pro'"
+        end
+      end
+
+      allow_env_key = @provider_explicit || (!api_endpoint.nil? && preset.name != "custom")
+      @api_key = api_key || (allow_env_key ? env_key_for(preset) : nil)
+
+      @capabilities = preset.capabilities_for(@model)
+      @capabilities = capabilities_override.apply(@capabilities) if capabilities_override
+
+      @api_style = api_style || :chat_completions
+      validate_api_style(@api_style)
+
+      @fallbacks = fallbacks || [] of Config
+      @fallbacks.each do |fallback|
+        unless fallback.fallbacks.empty?
+          raise ConfigurationError.new("nested fallbacks are not supported")
+        end
+      end
+
+      @api_path = api_path
+      @query_params = query_params || {} of String => String
+      strict_override = strict_stream_end
+      @strict_stream_end = strict_override.nil? ? @capabilities.strict_stream_end : strict_override
+
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)
       validate_max_history(@max_history)
       validate_max_tool_iterations(@max_tool_iterations)
 
-      # Accept Int32 seconds for timeouts (convenience)
       @read_timeout = parse_timeout(read_timeout)
       @connect_timeout = parse_timeout(connect_timeout)
+
+      @retry_policy = retry_policy || RetryPolicy.new(
+        max_retries: max_retries || 2,
+        backoff_base: parse_timeout(retry_backoff_base) || 500.milliseconds,
+        backoff_max: parse_timeout(retry_backoff_max) || 8.seconds,
+        max_retry_after: parse_timeout(max_retry_after) || 120.seconds,
+      )
+
+      @request_options = fold_legacy_options(request_options)
+      @request_options.validate!
 
       # SSE per-read timeouts. Same Int32-or-Span convenience as the legacy
       # timeouts above.
@@ -85,6 +167,32 @@ class Agent
       @parsed_uri = URI.parse(@api_endpoint)
       unless @parsed_uri.scheme && @parsed_uri.host
         raise ArgumentError.new("api_endpoint must be a valid URL, got #{@api_endpoint}")
+      end
+    end
+
+    def max_retries : Int32
+      @retry_policy.max_retries
+    end
+
+    private def fold_legacy_options(options : RequestOptions?) : RequestOptions
+      legacy = RequestOptions.new
+      legacy.max_tokens = @max_tokens
+      legacy.temperature = @temperature
+      legacy.merge(options)
+    end
+
+    private def env_key_for(preset : Provider::Preset) : String?
+      if key = preset.env_key
+        ENV[key]?
+      end
+    end
+
+    private def validate_api_style(style : Symbol) : Nil
+      unless style == :chat_completions || style == :responses
+        raise ConfigurationError.new("api_style must be :chat_completions or :responses, got #{style}")
+      end
+      if style == :responses && !@capabilities.responses_api
+        raise ConfigurationError.new("Provider '#{@provider_name}' does not support the Responses API")
       end
     end
 
@@ -179,10 +287,22 @@ class Agent
     # The chat completions path derived from api_endpoint.
     # Normalises duplicate slashes in the endpoint path.
     def chat_path : String
+      build_path(@preset.chat_path)
+    end
+
+    def responses_path : String
+      build_path(@preset.responses_path)
+    end
+
+    private def build_path(suffix : String) : String
+      if path = @api_path
+        return path.starts_with?("/") ? path : "/#{path}"
+      end
       base_path = @parsed_uri.path.empty? || @parsed_uri.path == "/" ? "" : @parsed_uri.path.rstrip('/')
       # Normalize duplicate slashes (e.g. "//v1" -> "/v1")
-      normalized = base_path.gsub(/\/+/, "/")
-      "#{normalized}/chat/completions"
+      normalized = "#{base_path}/#{suffix.lstrip('/')}".gsub(/\/+/, "/")
+      normalized = "/#{normalized}" unless normalized.starts_with?("/")
+      normalized
     end
   end
 end

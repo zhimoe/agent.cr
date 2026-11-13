@@ -2,3 +2,5 @@
 lib
 bin/ameba
 examples/rpg/*.json
+
+bin/ameba.dwarf

@@ -1,6 +1,9 @@
+require "json"
+require "../base"
+
 class Agent
   module Provider
-    class OpenAI
+    class OpenAI < Base
       # Accumulates a tool call across multiple SSE deltas.
       # Must be a class (reference type) so the hash entry is mutated in place.
       private class ToolCallDelta
@@ -150,6 +153,7 @@ class Agent
           *,
           first_byte_timeout : Time::Span? = nil,
           idle_timeout : Time::Span? = nil,
+          strict_end : Bool = false,
         ) : {Message, Usage, String?}
           tool_calls = ToolCallAccumulator.new
           content_buffer = String::Builder.new
@@ -157,6 +161,9 @@ class Agent
           usage = Usage.new
           finish_reason = nil
           read_count = 0
+          saw_done = false
+          saw_finish_reason = false
+          cancelled = false
 
           # Apply per-read timeouts to the IO when it supports them. Real
           # HTTP::Client body_io (HTTP::ChunkedContent / SSL sockets) honours
@@ -173,7 +180,10 @@ class Agent
             # Check for cancellation before each blocking read — the cancel
             # flag and the IO timeout race independently, but cancel should
             # win when both fire (see process_request_loop's order).
-            break if cancel.call
+            if cancel.call
+              cancelled = true
+              break
+            end
 
             # `#gets` consults `read_timeout` each invocation on IOs that
             # support it. Catch IO::TimeoutError and re-raise as IdleTimeoutError
@@ -198,6 +208,11 @@ class Agent
               apply_read_timeout(body_io, idle_timeout)
             end
 
+            # Keep reading after [DONE] until EOF so the HTTP client consumes
+            # the chunked-body terminator; breaking early poisons keep-alive
+            # connections for the next request.
+            saw_done = true if done_line?(line)
+
             usage, finish_reason = handle_line(
               line,
               response,
@@ -207,6 +222,15 @@ class Agent
               usage,
               finish_reason,
             )
+            saw_finish_reason = true unless finish_reason.nil?
+          end
+
+          if !cancelled && !saw_done && !saw_finish_reason
+            if !response.output_started?
+              raise StreamTruncatedError.new("stream ended without any output or terminal event")
+            elsif strict_end
+              raise StreamTruncatedError.new("stream ended without a finish_reason or [DONE]")
+            end
           end
 
           final_message = build_final_message(content_buffer, reasoning_buffer, tool_calls.deltas)
@@ -219,6 +243,12 @@ class Agent
         # JSON are no-ops (per SSE convention, any byte arrival resets the idle
         # timer — that reset happens in `#parse` after each successful read,
         # regardless of whether the line produced deltas).
+        private def done_line?(line : String) : Bool
+          stripped = line.strip
+          return false unless stripped.starts_with?("data:")
+          stripped[5..].lstrip(' ').starts_with?("[DONE]")
+        end
+
         private def handle_line(
           line : String,
           response : Response,
@@ -232,7 +262,6 @@ class Agent
           return {usage, finish_reason} if line.empty?
           return {usage, finish_reason} unless line.starts_with?("data:")
 
-          # SSE sentinel — skip [DONE] (with or without space after data:)
           rest = line[5..].lstrip(' ')
           return {usage, finish_reason} if rest.starts_with?("[DONE]")
 
@@ -244,8 +273,21 @@ class Agent
           parsed = json.as_h?
           return {usage, finish_reason} unless parsed
 
+          if parsed["error"]? || parsed["type"]?.try(&.as_s?) == "error"
+            raise ErrorFactory.stream_error(json)
+          end
+
           new_usage = parse_usage(parsed, usage)
           new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_calls) || finish_reason
+
+          if new_finish && (new_finish == "insufficient_system_resource" || new_finish == "aborted")
+            raise StreamError.new(
+              "provider stream ended with finish_reason=#{new_finish}",
+              code: new_finish,
+              retryable: true,
+            )
+          end
+
           {new_usage, new_finish}
         end
 
@@ -266,16 +308,16 @@ class Agent
         private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
           if usage_data = parsed["usage"]?
             if u = usage_data.as_h?
-              return Usage.new(
-                prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
-                completion_tokens: u["completion_tokens"]?.try(&.as_i),
-                total_tokens: u["total_tokens"]?.try(&.as_i)
-              )
+              return Usage.from_chat(u)
+            end
+          elsif groq = parsed["x_groq"]?.try(&.as_h?)
+            if u = groq["usage"]?.try(&.as_h?)
+              return Usage.from_chat(u)
             end
           elsif timings = parsed["timings"]?
             if timings_h = timings.as_h?
-              prompt_n = timings_h["prompt_n"]?.try(&.as_i)
-              predicted_n = timings_h["predicted_n"]?.try(&.as_i)
+              prompt_n = int32(timings_h["prompt_n"]?)
+              predicted_n = int32(timings_h["predicted_n"]?)
               return Usage.new(
                 prompt_tokens: prev_usage.prompt_tokens || prompt_n,
                 completion_tokens: prev_usage.completion_tokens || predicted_n,
@@ -284,6 +326,12 @@ class Agent
             end
           end
           prev_usage
+        end
+
+        private def int32(value : JSON::Any?) : Int32?
+          value.try(&.as_i?).try(&.to_i32)
+        rescue OverflowError
+          nil
         end
 
         private def process_deltas(
@@ -297,9 +345,13 @@ class Agent
 
           choices = parsed["choices"]?.try(&.as_a?) || [] of JSON::Any
           choices.each do |choice|
+            index = choice["index"]?.try(&.as_i?) || 0
+            next unless index == 0
+
             delta = choice["delta"]?.try(&.as_h?) || next
 
             if reason = choice["finish_reason"]?.try(&.as_s?)
+              reason = "tool_calls" if reason == "function_call"
               finish_reason = reason
             end
 

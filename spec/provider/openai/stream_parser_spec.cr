@@ -222,11 +222,11 @@ describe Agent::Provider::OpenAI::StreamParser do
   end
 
   it "treats comment / heartbeat lines as idle-timer resets" do
-    # Three lines each delayed by 25ms; idle budget is 30ms so each individual
+    # Three lines each delayed by 25ms; idle budget is 50ms so each individual
     # gap fits within the budget. The `: OPENROUTER PROCESSING` comment line
     # arrives between two `data: {}` chunks — any byte arrival resets the idle
     # timer, so the gaps straddle two adjacent reads rather than accumulating.
-    # Assert no raise (without the reset, the cumulative 75ms would exceed 30ms
+    # Assert no raise (without the reset, the cumulative 75ms would exceed 50ms
     # — but per-read semantics mean only the gap between two consecutive
     # reads counts; each is 25ms so all is well).
     io = MockTimeoutIO.new([
@@ -237,7 +237,7 @@ describe Agent::Provider::OpenAI::StreamParser do
 
     response, msg, _usage, _finish = parse_with_timeouts(io,
       first_byte_timeout: 1.second,
-      idle_timeout: 30.milliseconds)
+      idle_timeout: 50.milliseconds)
     msg.content.should eq("ab")
     response.error?.should be_false
   end

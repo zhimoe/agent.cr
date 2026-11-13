@@ -53,7 +53,42 @@ class Agent
       end
     end
 
+    # Diagnostic record for one provider attempt (retry or fallback).
+    struct Attempt
+      getter index : Int32
+      getter provider : String
+      getter model : String
+      getter status_code : Int32?
+      getter error : Agent::Error?
+      getter request_id : String?
+      getter retry_after : Time::Span?
+      getter duration : Time::Span?
+      getter delay_before : Time::Span?
+      getter output_started : Bool
+
+      def initialize(
+        @index : Int32,
+        @provider : String,
+        @model : String,
+        @status_code : Int32? = nil,
+        @error : Agent::Error? = nil,
+        @request_id : String? = nil,
+        @retry_after : Time::Span? = nil,
+        @duration : Time::Span? = nil,
+        @delay_before : Time::Span? = nil,
+        @output_started : Bool = false,
+      )
+      end
+
+      def success? : Bool
+        @error.nil?
+      end
+    end
+
     # --- channels used internally by the agent ---
+
+    # Closed by #cancel to wake a backoff waiter immediately.
+    getter cancel_signal : Channel(Nil)
 
     # The fiber pushes streamed Chunks here.
     private getter chunk_channel : Channel(Chunk)
@@ -79,6 +114,10 @@ class Agent
     @finish_reason : String?
     @error : Agent::Error?
     @chunk_handler : (Chunk -> Chunk)?
+    @output_started = false
+    @attempts : Array(Attempt)
+    @request_id : String?
+    @partial_message : Message?
 
     # Cached values so the second call to #message / #metadata
     # does not block on the channel again.
@@ -91,6 +130,42 @@ class Agent
       @usage_channel = Channel(Usage).new(1)
       @chunk_handler = nil
       @mutex = Sync::Mutex.new
+      @attempts = [] of Attempt
+      @cancel_signal = Channel(Nil).new
+    end
+
+    # True once any content/reasoning/tool-call chunk has been produced.
+    # Retry/fallback is forbidden after this point.
+    def output_started? : Bool
+      synchronize { @output_started }
+    end
+
+    # Record a provider attempt for diagnostics.
+    def record_attempt(attempt : Attempt) : Nil
+      synchronize { @attempts << attempt }
+    end
+
+    def attempts : Array(Attempt)
+      synchronize { @attempts.dup }
+    end
+
+    # HTTP request id of the successful (or final) attempt.
+    def request_id : String?
+      synchronize { @request_id }
+    end
+
+    def request_id=(value : String?) : Nil
+      synchronize { @request_id = value }
+    end
+
+    # Partial assistant message captured before a cancellation. Used by
+    # Agent#handle_cancellation to preserve only real streamed content.
+    def partial_message : Message?
+      synchronize { @partial_message }
+    end
+
+    def partial_message=(value : Message?) : Nil
+      synchronize { @partial_message = value }
     end
 
     # Shorthand for @mutex.synchronize — used by all flag accessors.
@@ -105,6 +180,7 @@ class Agent
     # and #error returns a CancelledError.
     def cancel : Nil
       synchronize { @cancelled = true }
+      @cancel_signal.close
     end
 
     # Returns true if cancel was requested.
@@ -184,7 +260,11 @@ class Agent
     #
     # When #stream is active, blocks until the consumer reads.
     def push_chunk(chunk : Chunk) : Nil
-      return unless synchronize { @streaming }
+      streaming = synchronize do
+        @output_started = true
+        @streaming
+      end
+      return unless streaming
 
       if handler = @chunk_handler
         chunk = handler.call(chunk)

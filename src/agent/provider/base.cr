@@ -9,10 +9,28 @@ class Agent
     # The Agent core (fiber loop, history, tool resolution) talks only to
     # this interface and to canonical domain types (Message, ToolCall, Usage).
     abstract class Base
+      alias Request = NamedTuple(path: String, headers: HTTP::Headers, body: String)
+
       # Build an HTTP request for the given messages and optional tools.
       # Returns the path (relative to the provider's base URI), headers,
       # and the JSON body string.
-      abstract def build_request(messages : Array(Message), tools : Array(Tool)?) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
+      abstract def build_request(messages : Array(Message), tools : Array(Tool)?) : Request
+
+      # RequestOptions-aware overload. Legacy custom providers keep compiling:
+      # the default implementation ignores the options and calls the 2-arg
+      # method above.
+      def build_request(
+        messages : Array(Message),
+        tools : Array(Tool)?,
+        options : RequestOptions,
+      ) : Request
+        build_request(messages, tools)
+      end
+
+      # Human-readable provider name for diagnostics.
+      def name : String
+        self.class.name
+      end
 
       # Parse a streaming SSE response body and push Chunks onto `response`.
       # Returns the final assembled {Message, Usage, finish_reason}.

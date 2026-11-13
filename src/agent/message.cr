@@ -320,6 +320,35 @@ class Agent
     def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
     end
 
+    # Build from a Chat Completions `usage` object.
+    def self.from_chat(hash : Hash(String, JSON::Any)?) : Usage
+      return new if hash.nil?
+      new(
+        prompt_tokens: int32_value(hash["prompt_tokens"]?),
+        completion_tokens: int32_value(hash["completion_tokens"]?),
+        total_tokens: int32_value(hash["total_tokens"]?),
+      )
+    end
+
+    # Build from a Responses `response.usage` object.
+    def self.from_responses(hash : Hash(String, JSON::Any)?) : Usage
+      return new if hash.nil?
+      new(
+        prompt_tokens: int32_value(hash["input_tokens"]?),
+        completion_tokens: int32_value(hash["output_tokens"]?),
+        total_tokens: int32_value(hash["total_tokens"]?),
+      )
+    end
+
+    private def self.int32_value(value : JSON::Any?) : Int32?
+      return if value.nil?
+      if raw = value.as_i?
+        raw.to_i32
+      end
+    rescue OverflowError
+      nil
+    end
+
     # Nil-safe addition: sums each field over both usages. A field is nil in
     # the result only when it is nil on both sides, so `Usage.new + Usage.new`
     # stays all-nil. Lets callers accumulate usage across a multi-iteration
@@ -354,6 +383,8 @@ class Agent
     getter tool_call_id : String?
     getter name : String?
     getter reasoning : String?
+    # Provider-specific replay state (Responses output items, response id).
+    getter provider_data : JSON::Any?
 
     def initialize(
       @role : Role,
@@ -363,6 +394,7 @@ class Agent
       @tool_call_id : String? = nil,
       @name : String? = nil,
       @reasoning : String? = nil,
+      @provider_data : JSON::Any? = nil,
     )
     end
 
@@ -377,8 +409,14 @@ class Agent
     end
 
     # Create an assistant message.
-    def self.assistant(content : String? = nil, tool_calls : Array(ToolCall)? = nil, reasoning : String? = nil) : self
-      new(role: Role::Assistant, content: content, tool_calls: tool_calls, reasoning: reasoning)
+    def self.assistant(
+      content : String? = nil,
+      tool_calls : Array(ToolCall)? = nil,
+      reasoning : String? = nil,
+      provider_data : JSON::Any? = nil,
+    ) : self
+      new(role: Role::Assistant, content: content, tool_calls: tool_calls,
+        reasoning: reasoning, provider_data: provider_data)
     end
 
     # Create a tool-result message from a completed tool call.
@@ -400,7 +438,8 @@ class Agent
       @role == other.role && @content == other.content &&
         @content_parts == other.content_parts &&
         @tool_call_id == other.tool_call_id && @name == other.name &&
-        @tool_calls == other.tool_calls && @reasoning == other.reasoning
+        @tool_calls == other.tool_calls && @reasoning == other.reasoning &&
+        @provider_data == other.provider_data
     end
 
     def ==(other) : Bool
@@ -421,11 +460,18 @@ class Agent
       if @reasoning
         io << " (reasoning)"
       end
+      if @provider_data
+        io << " (provider_data)"
+      end
       io << ">"
     end
 
     # :nodoc:
-    def to_request_body : Hash(String, JSON::Any)
+    def to_request_body(
+      *,
+      include_reasoning_content : Bool = false,
+      reasoning_placeholder : String? = nil,
+    ) : Hash(String, JSON::Any)
       body = {"role" => JSON::Any.new(@role.to_s)}
 
       # Build content
@@ -453,6 +499,14 @@ class Agent
             }),
           })
         end)
+      end
+
+      if include_reasoning_content && @role == Role::Assistant
+        if reasoning = @reasoning
+          body["reasoning_content"] = JSON::Any.new(reasoning)
+        elsif placeholder = reasoning_placeholder
+          body["reasoning_content"] = JSON::Any.new(placeholder)
+        end
       end
 
       body

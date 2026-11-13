@@ -157,4 +157,41 @@ describe Agent::Usage do
     empty.completion_tokens.should be_nil
     empty.total_tokens.should be_nil
   end
+
+  it "round-trips reasoning_content only when explicitly requested" do
+    msg = Agent::Message.new(role: Agent::Role::Assistant, reasoning: "why")
+    msg.to_request_body["reasoning_content"]?.should be_nil
+    msg.to_request_body(include_reasoning_content: true)["reasoning_content"].as_s.should eq("why")
+
+    no_reasoning = Agent::Message.new(role: Agent::Role::Assistant)
+    no_reasoning.to_request_body(
+      include_reasoning_content: true,
+      reasoning_placeholder: " ",
+    )["reasoning_content"].as_s.should eq(" ")
+  end
+
+  it "round-trips provider_data through JSON" do
+    data = JSON.parse(%({"provider":"openai","model":"gpt-5","items":[{"type":"reasoning"}]}))
+    msg = Agent::Message.new(role: Agent::Role::Assistant, content: "hi", provider_data: data)
+    restored = Agent::Message.from_json(msg.to_json)
+    restored.provider_data.should eq(data)
+  end
+
+  it "maps Chat and Responses usage shapes" do
+    chat = Agent::Usage.from_chat({
+      "prompt_tokens"     => JSON::Any.new(10),
+      "completion_tokens" => JSON::Any.new(5),
+      "total_tokens"      => JSON::Any.new(15),
+    })
+    chat.prompt_tokens.should eq(10)
+    chat.completion_tokens.should eq(5)
+
+    responses = Agent::Usage.from_responses({
+      "input_tokens"  => JSON::Any.new(20),
+      "output_tokens" => JSON::Any.new(8),
+      "total_tokens"  => JSON::Any.new(28),
+    })
+    responses.prompt_tokens.should eq(20)
+    responses.completion_tokens.should eq(8)
+  end
 end

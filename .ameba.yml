@@ -7,3 +7,13 @@ Naming/BlockParameterName:
   Description: Disallows non-descriptive block parameter names
   Enabled: false
   Severity: Convention
+
+# Capabilities/preset fields are data, not predicates. Renaming them to
+# `max_tokens?` would obscure the wire-parameter mapping.
+Naming/QueryBoolMethods:
+  Enabled: false
+
+# Config resolution, request builders, and SSE parsers branch on protocol
+# details; this metric is not actionable for them.
+Metrics/CyclomaticComplexity:
+  Enabled: false

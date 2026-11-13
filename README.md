@@ -6,7 +6,7 @@ A Crystal shard for building agentic loops with OpenAI-compatible APIs.
 
 Inspired by [RubyLLM](https://rubyllm.com/) — a fantastic Ruby gem for interacting with AI models.
 
-`agent-cr` wraps any OpenAI-compatible streaming chat-completion endpoint behind a fiber-based async interface. It handles streaming, tool calls, multimodal content, conversation history, and automatic tool resolution — all in a background fiber so your code never blocks.
+`agent-cr` wraps any OpenAI-compatible streaming chat-completion endpoint behind a fiber-based async interface. It handles streaming, tool calls, multimodal content, conversation history, automatic tool resolution, named provider presets (OpenAI, DeepSeek, OpenRouter, Groq, Together, Ollama, vLLM, custom), retries/backoff, and cross-provider fallback — all in a background fiber so your code never blocks.
 
 ---
 
@@ -198,7 +198,11 @@ resp.stream { |chunk| print chunk.text }
 puts resp.message.content # => "The weather in Paris is sunny."
 ```
 
-You can `register_tool` multiple times. All registered tools are merged into every request automatically. If a per-request tool has the same name as a registered tool, the registered callback wins.
+Pass `strict: true` to `register_tool` (or set `Agent::Tool::FunctionDef#strict`)
+to request provider-side strict schema validation. You can `register_tool`
+multiple times; all registered tools are merged into every request
+automatically. If a per-request tool has the same name as a registered tool,
+the registered callback wins.
 
 ### Tool activation control
 
@@ -376,7 +380,119 @@ crystal run examples/handlers.cr
 
 ## Provider system
 
-`agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, OpenRouter, Anthropic via proxy, local llama.cpp, Ollama, etc.).
+`agent-cr` uses a provider-neutral core with named OpenAI-compatible presets.
+The default is the `openai` preset. Presets are data: endpoint, auth header,
+path, default model, and capability flags. One generic Chat Completions engine
+handles OpenAI, DeepSeek, OpenRouter, Groq, Together, Ollama, vLLM, and any
+custom OpenAI-compatible endpoint.
+
+### Provider presets
+
+```crystal
+# DeepSeek: endpoint/model/auth come from the preset. The API key is read from
+# DEEPSEEK_API_KEY only when the provider is named explicitly.
+config = Agent::Config.new(
+  provider: "deepseek",
+  system_prompt: "You are a coding assistant.",
+)
+
+agent = Agent.new(config)
+```
+
+Built-in presets: `openai`, `deepseek`, `openrouter`, `groq`, `together`,
+`ollama`, `vllm`, `custom`. Explicit `api_endpoint`, `model`, and `api_key`
+override preset defaults. `provider: "custom"` requires an endpoint; when
+`model` is omitted it falls back to `gpt-4o` with a warning for backward
+compatibility. Other presets without a default model require an explicit
+`model`.
+
+### Modern request options
+
+Global defaults live in `config.request_options`; per-request overrides are
+passed to `#ask`:
+
+```crystal
+schema = Agent::JSONConverter.from({
+  type: "object",
+  properties: {answer: {type: "string"}},
+  required: ["answer"],
+})
+
+defaults = Agent::RequestOptions.new
+defaults.max_completion_tokens = 4096
+defaults.reasoning_effort = "medium"
+defaults.response_format = Agent::ResponseFormat.json_schema(
+  "answer", schema, strict: true
+)
+
+config = Agent::Config.new(
+  provider: "openai",
+  model: "gpt-5",
+  request_options: defaults,
+)
+
+override = Agent::RequestOptions.new
+override.parallel_tool_calls = false
+override.tool_choice = Agent::ToolChoice.auto
+resp = agent.ask("Return JSON", options: override)
+```
+
+`RequestOptions` covers `max_tokens`/`max_completion_tokens`, temperature,
+top_p, stop, seed, penalties, reasoning_effort, verbosity, thinking, store,
+metadata, service_tier, parallel_tool_calls, tool_choice, response_format,
+prompt_cache_key, include, extra_body, extra_headers, and max_retries.
+Provider-specific long-tail fields go through `extra_body`.
+
+Capabilities are checked before HTTP: a feature the preset cannot honor
+raises `Agent::UnsupportedCapabilityError` (which may fall back to another
+provider) instead of being silently dropped.
+
+### Retries and fallback
+
+```crystal
+config = Agent::Config.new(
+  provider: "openai",
+  model: "gpt-5",
+  max_retries: 2,                    # default 2; 0 disables retries
+  retry_backoff_base: 500.milliseconds,
+  retry_backoff_max: 8.seconds,
+  max_retry_after: 120.seconds,
+  fallbacks: [
+    Agent::Config.new(provider: "deepseek", model: "deepseek-flash", max_retries: 0),
+  ],
+)
+```
+
+- Retries: `408`, `409`, `429`, `>=500`, connection errors, and first-byte
+  timeouts, with exponential backoff + jitter and `Retry-After` support.
+- `x-should-retry: true|false` overrides the status-based decision.
+- Fallback: on any non-fatal error before streamed output starts (including
+  capability mismatches, 400/401/404), the next provider config is tried.
+- Once any content/reasoning/tool-call chunk has been produced, no retry or
+  fallback is attempted.
+- `Response#attempts` exposes `provider`, `model`, `status_code`,
+  `request_id`, `retry_after`, `duration`, `delay_before`, and `error`.
+
+### Responses API
+
+Use `api_style: :responses` to switch the wire format (OpenAI preset):
+
+```crystal
+config = Agent::Config.new(
+  provider: "openai",
+  model: "gpt-5",
+  api_style: :responses,
+)
+```
+
+The Responses provider converts canonical `Message` history into `input`
+items (`function_call` / `function_call_output`), uses flat `tools` and
+`tool_choice`, maps `text.format`, and parses
+`response.output_text.delta`, reasoning deltas,
+`response.function_call_arguments.delta/done`, and
+`response.completed/failed/incomplete`. It defaults to `store: false`; original
+output items are stored on `Message#provider_data` and replayed on later turns
+when the provider/model match, preserving reasoning items.
 
 ### Switch endpoint for a compatible API
 
@@ -404,7 +520,9 @@ class MyProvider < Agent::Provider::Base
     {path: "/chat", headers: HTTP::Headers{"X-API-Key" => "secret"}, body: my_body.to_json}
   end
 
-  def parse_stream(io, response, cancel) : {Message, Usage, String?}
+  def parse_stream(io, response, cancel,
+                   first_byte_timeout : Time::Span? = nil,
+                   idle_timeout : Time::Span? = nil) : {Message, Usage, String?}
     # Parse response body, push chunks, return final message
   end
 
@@ -417,7 +535,7 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 
 ---
 
-## Response API
+## Response handle
 
 | Method / Property | Description |
 |---|---|
@@ -431,6 +549,8 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 | `.finish_reason` | Why the stream ended (`"stop"`, `"length"`, `"tool_calls"`, etc.) |
 | `.cancel` | Request cancellation of the in-flight request |
 | `.cancelled?` | Whether cancellation was requested |
+| `.attempts` | Diagnostic list of provider attempts (provider, model, status, error, request id, retry-after, duration, delay) |
+| `.request_id` | HTTP request id of the successful/final attempt |
 
 ### Message fields
 
@@ -451,27 +571,39 @@ msg.has_tool_calls? # Bool — convenience check
 
 ```crystal
 Agent::Config.new(
-  api_key:            String?,             # OpenAI API key (or nil for local models)
-  api_endpoint:       String,              # default: "https://api.openai.com/v1"
-  model:              String,              # default: "gpt-4o"
-  system_prompt:      String?,             # optional system message prepended to every request
-  max_tokens:         Int32?,              # optional max completion tokens
-  temperature:        Float64?,            # optional sampling temperature (0.0-2.0)
-  read_timeout:       Time::Span | Int32?, # optional HTTP read timeout (seconds or span)
-  connect_timeout:    Time::Span | Int32?, # optional HTTP connect timeout (seconds or span)
-  max_history:        Int32?,              # optional max conversation turns (0 or nil = no limit)
+  provider:          String?,              # preset name; default "openai" / inferred from endpoint
+  api_key:           String?,              # explicit key; otherwise preset env key when safe
+  api_endpoint:      String?,              # preset default or explicit base URL
+  model:             String?,              # preset default or explicit model
+  system_prompt:     String?,              # optional system message prepended to every request
+  max_tokens:        Int32?,               # legacy token cap; mapped per provider
+  temperature:       Float64?,             # optional sampling temperature (0.0-2.0)
+  read_timeout:      Time::Span | Int32?,  # optional HTTP read timeout
+  connect_timeout:   Time::Span | Int32?,  # optional HTTP connect timeout
+  max_history:       Int32?,               # optional max conversation turns
   auto_execute_tools: Bool,                # default: true
-  extra_headers:      Hash(String, String)?, # optional extra HTTP headers
-  max_tool_iterations: Int32?,             # default: 100 — safety limit for tool loops
-  prompt_cache_key:   String?,             # optional explicit prompt cache key
+  extra_headers:     Hash(String, String)?,
+  max_tool_iterations: Int32?,             # default: 100
+  prompt_cache_key:  String?,
+  request_options:   RequestOptions?,      # modern request defaults
+  api_style:         Symbol?,              # :chat_completions (default) or :responses
+  api_path:          String?,              # override path (Azure-style deployments)
+  query_params:      Hash(String, String)?,
+  fallbacks:         Array(Config)?,       # cross-provider fallback configs
+  retry_policy:      RetryPolicy?,         # full policy injection
+  max_retries:       Int32?,               # default: 2
+  retry_backoff_base: Time::Span | Int32?, # default: 500ms
+  retry_backoff_max:  Time::Span | Int32?, # default: 8s
+  max_retry_after:    Time::Span | Int32?, # default: 120s
+  strict_stream_end: Bool?,                # preset default; error on truncated output
   *,
   # Per-read SSE timeouts (fail-fast on hung connections):
-  first_byte_timeout_min:          Time::Span | Int32 = 60,  # TTFT floor (seconds or span)
-  first_byte_timeout_max:          Time::Span | Int32 = 300, # TTFT ceiling
-  first_byte_timeout_base:          Time::Span | Int32 = 3,   # routing + provider queue baseline
-  first_byte_timeout_ms_per_token:  Int32 = 3,                # ms added per estimated input token (~4 chars/token)
-  idle_byte_timeout:                Time::Span | Int32 = 60,  # gap allowed between any two consecutive SSE lines
-  compute_first_byte_timeout:       Bool = true,              # false → dynamic first-byte disabled, both phases use idle_byte_timeout
+  first_byte_timeout_min:          Time::Span | Int32 = 60,
+  first_byte_timeout_max:          Time::Span | Int32 = 300,
+  first_byte_timeout_base:         Time::Span | Int32 = 3,
+  first_byte_timeout_ms_per_token: Int32 = 3,
+  idle_byte_timeout:               Time::Span | Int32 = 60,
+  compute_first_byte_timeout:      Bool = true,
 )
 ```
 
@@ -500,8 +632,9 @@ config = Agent::Config.new(
   first_byte_timeout_max: 60.seconds,
   idle_byte_timeout: 5.seconds,
 )
-# → any prompt that emits nothing for 10s, or any mid-stream 5s stall,
-#   raises Agent::IdleTimeoutError without further retries.
+# → a prompt that emits nothing for 10s raises Agent::IdleTimeoutError
+#   (first-byte timeouts are retryable per RetryPolicy); a mid-stream 5s
+#   stall surfaces the error without retrying after output has started.
 ```
 
 ---
@@ -526,10 +659,14 @@ Error types:
 
 | Error | When |
 |---|---|
-| `Agent::ApiError` | API returned a non-2xx status code (includes `.status_code`) |
+| `Agent::ApiError` | Non-2xx API response; exposes `.status_code`, `.body`, `.request_id`, `.retry_after`, `.api_type`, `.param`, `.code`, `.should_retry` |
+| `Agent::BadRequestError` / `AuthenticationError` / `PermissionDeniedError` / `NotFoundError` / `RequestTimeoutError` / `ConflictError` / `UnprocessableEntityError` / `RateLimitError` / `InternalServerError` | Status-specific `ApiError` subclasses |
 | `Agent::ConnectionError` | Network / connection failure |
+| `Agent::StreamError` / `StreamTruncatedError` | Provider error event or truncated SSE stream |
 | `Agent::CancelledError` | Caller called `.cancel` on the response |
-| `Agent::IdleTimeoutError` | Provider stream stuck — no bytes within the first-byte or idle per-read timeout (`phase = :first_byte` or `:idle`, `timeout = Time::Span`) |
+| `Agent::IdleTimeoutError` | Provider stream stuck — no bytes within the first-byte or idle per-read timeout (`phase = :first_byte` or `:idle`) |
+| `Agent::UnsupportedCapabilityError` | The configured provider/model cannot honor a requested feature; eligible for fallback |
+| `Agent::ConfigurationError` | Invalid client-side configuration or reserved `extra_body` key; fatal for the turn |
 | `Agent::ToolLoopError` | Tool auto-resolve exceeded `max_tool_iterations` |
 | `Agent::SessionLoadError` | Loading a saved session failed due to corrupt or missing fields |
 | `Agent::ClosedError` | An operation was attempted on a closed agent |
@@ -571,7 +708,10 @@ agent.close
 
 ### Prompt caching
 
-When using APIs that support prompt caching (e.g. OpenAI, DeepSeek), set an explicit `prompt_cache_key` or use `agent.load` to restore a previous session — both preserve cache affinity:
+OpenAI supports an explicit `prompt_cache_key` (gated by the preset's
+capability flags). Set one or use `agent.load` to restore a previous session —
+both preserve cache affinity. Providers such as DeepSeek use their own
+automatic KV cache and do not receive `prompt_cache_key`:
 
 ```crystal
 # Auto-generated cache key tied to the session
@@ -585,6 +725,17 @@ agent.load(saved_session_string)
 ---
 
 ## Examples
+
+### Provider presets and reliability
+
+```sh
+# Pick a preset and override modern request options
+crystal run examples/providers.cr -- --provider deepseek
+
+# Retries + optional cross-provider fallback
+crystal run examples/reliability.cr -- --endpoint "$LLM_ENDPOINT" \
+  --model "$LLM_MODEL" --api-key "$LLM_API_KEY"
+```
 
 ### 🎲 Dungeons & Dragons — Text Adventure
 

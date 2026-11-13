@@ -9,10 +9,14 @@ class Agent
     def initialize
       super("Agent has been closed")
     end
+
+    def fatal? : Bool
+      true
+    end
   end
 
   # Internal request types sent to the processing fiber.
-  private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response
+  private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response, options : RequestOptions
 
   private alias Request = AskRequest
 
@@ -37,14 +41,95 @@ class Agent
   @history : Sync::Exclusive(Array(Message))
   @registered_tools : Sync::Exclusive(Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)))
 
-  # Persistent HTTP client for connection pooling across requests.
-  @http_client : HTTP::Client
-  # The per-read timeout value that was last applied to @http_client's socket at
-  # open time. Used by #apply_client_read_timeout to decide whether the client
-  # must be rebuilt so a new timeout value actually takes effect on the socket.
-  @applied_read_timeout : Time::Span?
-  # The provider handles all wire-format concerns.
-  @provider : Provider::Base
+  # One provider + HTTP client per endpoint (primary + fallbacks).
+  private class ProviderRuntime
+    getter provider : Provider::Base
+    getter config : Config
+    getter client : HTTP::Client
+    property applied_read_timeout : Time::Span?
+
+    def initialize(@config : Config, @provider : Provider::Base)
+      @client = build_client
+      @applied_read_timeout = nil
+    end
+
+    def name : String
+      @provider.name
+    end
+
+    def prepare(prompt_bytes : Int) : {Time::Span?, Time::Span}
+      first_byte = @config.compute_first_byte_timeout(prompt_bytes)
+      idle = @config.idle_byte_timeout
+      desired = @config.effective_read_timeout(prompt_bytes)
+      apply_read_timeout(desired) if desired
+      {first_byte, idle}
+    end
+
+    def rebuild_client : Nil
+      close_client
+      @client = build_client
+    end
+
+    def close : Nil
+      close_client
+      @provider.close
+    end
+
+    private def build_client : HTTP::Client
+      client = HTTP::Client.new(@provider.base_uri)
+      if (read_timeout = @config.read_timeout) && read_timeout > Time::Span.zero
+        client.read_timeout = read_timeout
+        @applied_read_timeout = read_timeout
+      else
+        @applied_read_timeout = nil
+      end
+      if (connect_timeout = @config.connect_timeout) && connect_timeout > Time::Span.zero
+        client.connect_timeout = connect_timeout
+      end
+      client
+    end
+
+    private def apply_read_timeout(timeout : Time::Span) : Nil
+      return unless timeout > Time::Span.zero
+      if timeout != @applied_read_timeout
+        rebuild_client
+        @client.read_timeout = timeout
+        @applied_read_timeout = timeout
+      else
+        @client.read_timeout = timeout
+      end
+    end
+
+    private def close_client : Nil
+      @client.close
+    rescue IO::Error
+      # ignore a possibly-broken socket
+    end
+  end
+
+  private class AttemptOutcome
+    getter result : {Message, Usage, String?}?
+    getter error : Agent::Error?
+    getter attempt : Response::Attempt
+
+    def initialize(
+      @result : {Message, Usage, String?}?,
+      @error : Agent::Error?,
+      @attempt : Response::Attempt,
+    )
+    end
+
+    def success? : Bool
+      !@result.nil?
+    end
+
+    def output_started? : Bool
+      @attempt.output_started
+    end
+  end
+
+  @runtimes : Array(ProviderRuntime)
+  @shutdown_channel : Channel(Nil)
   # Chain of handler decorators.
   @handlers : ChainHandler
 
@@ -57,11 +142,33 @@ class Agent
       {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
     )
     @state_mutex = Sync::Mutex.new
-    @provider = provider || Provider::OpenAI.new(@config, @cache_key)
-    @applied_read_timeout = nil
-    @http_client = build_http_client
+    @shutdown_channel = Channel(Nil).new
+    @runtimes = build_runtimes(provider)
     @handlers = ChainHandler.new
     @fiber = spawn { run_loop }
+  end
+
+  private def build_runtimes(provider : Provider::Base?) : Array(ProviderRuntime)
+    if provider
+      unless @config.fallbacks.empty?
+        raise ConfigurationError.new("fallbacks are not supported with a custom provider")
+      end
+      return [ProviderRuntime.new(@config, provider)]
+    end
+
+    configs = [@config] + @config.fallbacks
+    configs.map do |config|
+      ProviderRuntime.new(config, build_provider(config))
+    end
+  end
+
+  private def build_provider(config : Config) : Provider::Base
+    case config.api_style
+    when :responses
+      Provider::Responses.new(config, @cache_key)
+    else
+      Provider::OpenAI.new(config, @cache_key)
+    end
   end
 
   # Append a `Handler` to the chain. Handlers run left-to-right in the order
@@ -94,11 +201,20 @@ class Agent
   #   "The weather in #{city} is sunny."
   # end
   # ```
-  def register_tool(name : String, description : String? = nil, parameters : Hash(String, JSON::Any)? = nil, enabled : Bool = true, &block : Hash(String, JSON::Any) -> String) : Nil
+  def register_tool(
+    name : String,
+    description : String? = nil,
+    parameters : Hash(String, JSON::Any)? = nil,
+    enabled : Bool = true,
+    strict : Bool? = nil,
+    &block : Hash(String, JSON::Any) -> String
+  ) : Nil
     @state_mutex.synchronize { raise ClosedError.new if @closed }
     raise ArgumentError.new("Tool name must not be empty") if name.empty?
 
-    tool = Tool.new(Tool::FunctionDef.new(name: name, description: description, parameters: parameters))
+    tool = Tool.new(Tool::FunctionDef.new(
+      name: name, description: description, parameters: parameters, strict: strict
+    ))
     entry = {tool: tool, callback: block, enabled: enabled}
 
     @registered_tools.lock { |t| t[name] = entry }
@@ -147,8 +263,8 @@ class Agent
   def close : Nil
     @state_mutex.synchronize { return if @closed; @closed = true }
     @request_channel.close
-    @http_client.close
-    @provider.close
+    @shutdown_channel.close
+    @runtimes.each(&.close)
   end
 
   # Send a user message and return a Response immediately.
@@ -169,8 +285,17 @@ class Agent
   # ```
   #
   # Raises Agent::ClosedError if the agent has been closed via #close.
-  def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil) : Response
+  def ask(
+    content : String,
+    attachments : Array(String)? = nil,
+    tools : Array(Tool)? = nil,
+    *,
+    options : RequestOptions? = nil,
+  ) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
+
+    effective_options = options || RequestOptions.new
+    effective_options.validate!
 
     msg = if atts = attachments
             parts = [ContentPart.new(type: :text, text: content)] + atts.map { |path| ContentPart.from_path(path) }
@@ -180,7 +305,7 @@ class Agent
           end
 
     response = Response.new
-    @request_channel.send(AskRequest.new([msg], tools, response))
+    @request_channel.send(AskRequest.new([msg], tools, response, effective_options))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -190,11 +315,19 @@ class Agent
   # Used to feed tool call results back to the model after it requests them.
   #
   # Raises Agent::ClosedError if the agent has been closed via #close.
-  def ask(tool_results : Array(Message), tools : Array(Tool)? = nil) : Response
+  def ask(
+    tool_results : Array(Message),
+    tools : Array(Tool)? = nil,
+    *,
+    options : RequestOptions? = nil,
+  ) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
 
+    effective_options = options || RequestOptions.new
+    effective_options.validate!
+
     response = Response.new
-    @request_channel.send(AskRequest.new(tool_results, tools, response))
+    @request_channel.send(AskRequest.new(tool_results, tools, response, effective_options))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -434,6 +567,11 @@ class Agent
     max_iter = @config.max_tool_iterations
     iteration = 0
 
+    # Remember where this turn started. On a terminal failure, truncate back to
+    # this point; popping `request.new_messages` is wrong after a tool-loop
+    # iteration because the newest entries are tool/assistant messages.
+    start_size = @history.lock(&.size)
+
     # Append new messages to history under the lock, then snapshot for the HTTP call.
     history_snapshot = @history.lock do |h|
       h.concat(request.new_messages)
@@ -446,71 +584,80 @@ class Agent
     # finishing iteration's counts.
     total_usage = Usage.new
 
-    loop do
-      iteration += 1
+    begin
+      loop do
+        iteration += 1
 
-      # Pre-flight bail-out checks (closed / cancelled / iteration limit).
-      # Returns true if the loop should break.
-      if preflight_bailout?(response, iteration, max_iter)
-        break
+        # Pre-flight bail-out checks (closed / cancelled / iteration limit).
+        # Returns true if the loop should break.
+        if preflight_bailout?(response, iteration, max_iter)
+          break
+        end
+
+        response.chunk_handler = ->(chunk : Response::Chunk) {
+          @handlers.decorate(ChunkContext.new(chunk), &.chunk)
+        }
+        msg, usage, finish_reason = http_post_stream(messages, tools, response, request.options)
+
+        # Cancellation is a user-initiated abort, not a failure: the partial
+        # assistant reply and the user's messages are real conversation context
+        # and must be preserved so the next #ask has continuity.
+        if response.cancelled?
+          handle_cancellation(response)
+          break
+        end
+
+        # On a genuine error, http_post_stream already called
+        # response.finish_with_error. Remove everything this turn appended so
+        # subsequent #ask calls see a clean history.
+        if response.error?
+          truncate_history_to!(start_size)
+          break
+        end
+
+        # Append the assistant message to history under the lock.
+        @history.lock { |h| h << msg }
+        total_usage = total_usage + usage
+
+        # Determine whether to auto-resolve tools (read under the lock).
+        has_registered_tools = @registered_tools.lock(&.empty?.!)
+
+        # If no tool calls, or auto_execute is disabled, or no registered tools — done.
+        no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || !has_registered_tools
+        if no_tools
+          trim_history!
+          response.finish(msg, total_usage, finish_reason: finish_reason)
+          break
+        end
+
+        # ameba:disable Lint/NotNil
+        tool_calls = msg.tool_calls.not_nil!
+        results = execute_registered_tools(tool_calls, response)
+
+        # If some tools had no registered handler, stop and let the caller handle it.
+        # NOTE: The assistant(tool_calls) is already in @history. The caller MUST
+        # follow up with #ask(tool_results) so the tool messages follow the
+        # assistant(tool_calls) — otherwise the next API request will be invalid.
+        if results.empty?
+          trim_history!
+          response.finish(msg, total_usage, finish_reason: finish_reason)
+          break
+        end
+
+        # Append tool results to history under the lock, then rebuild messages for next iteration.
+        @history.lock(&.concat(results))
+        history_snapshot = @history.lock(&.dup)
+        messages = build_messages(history_snapshot, [] of Message)
       end
-
-      response.chunk_handler = ->(chunk : Response::Chunk) {
-        @handlers.decorate(ChunkContext.new(chunk), &.chunk)
-      }
-      msg, usage, finish_reason = http_post_stream(messages, tools, response)
-
-      # Cancellation is a user-initiated abort, not a failure: the partial
-      # assistant reply and the user's messages are real conversation context
-      # and must be preserved so the next #ask has continuity.
-      if response.cancelled?
-        handle_cancellation(msg, response)
-        break
-      end
-
-      # On a genuine error (network/API/JSON), http_post_stream already called
-      # response.finish_with_error. Roll back the user messages that were
-      # appended at the start of this request so history is not corrupted for
-      # subsequent #ask calls (the turn never produced a usable assistant reply).
-      if response.error?
-        @history.lock { |h| request.new_messages.each { h.pop } }
-        break
-      end
-
-      # Append the assistant message to history under the lock.
-      @history.lock { |h| h << msg }
-      total_usage = total_usage + usage
-
-      # Determine whether to auto-resolve tools (read under the lock).
-      has_registered_tools = @registered_tools.lock(&.empty?.!)
-
-      # If no tool calls, or auto_execute is disabled, or no registered tools — done.
-      no_tools = !msg.has_tool_calls? || !@config.auto_execute_tools? || !has_registered_tools
-      if no_tools
-        trim_history!
-        response.finish(msg, total_usage, finish_reason: finish_reason)
-        break
-      end
-
-      # ameba:disable Lint/NotNil
-      tool_calls = msg.tool_calls.not_nil!
-      results = execute_registered_tools(tool_calls, response)
-
-      # If some tools had no registered handler, stop and let the caller handle it.
-      # NOTE: The assistant(tool_calls) is already in @history. The caller MUST
-      # follow up with #ask(tool_results) so the tool messages follow the
-      # assistant(tool_calls) — otherwise the next API request will be invalid.
-      if results.empty?
-        trim_history!
-        response.finish(msg, total_usage, finish_reason: finish_reason)
-        break
-      end
-
-      # Append tool results to history under the lock, then rebuild messages for next iteration.
-      @history.lock(&.concat(results))
-      history_snapshot = @history.lock(&.dup)
-      messages = build_messages(history_snapshot, [] of Message)
+    rescue ex
+      err = ex.is_a?(Agent::Error) ? ex : ConnectionError.new(ex.message || ex.class.name, cause: ex)
+      response.finish_with_error(err) unless response.finished?
+      truncate_history_to!(start_size)
     end
+  end
+
+  private def truncate_history_to!(size : Int32) : Nil
+    @history.replace { |h| h[0, size] }
   end
 
   # Preserve the canceled turn in history.
@@ -520,9 +667,12 @@ class Agent
   # appended to history so the next #ask has continuity (the user's question
   # was already appended at the start of #process_request_loop and is kept).
   # The response is then finished with a CancelledError.
-  private def handle_cancellation(partial_msg : Message, response : Response) : Nil
-    has_content = !partial_msg.content.nil? || !partial_msg.tool_calls.nil?
-    @history.lock { |h| h << partial_msg } if has_content
+  private def handle_cancellation(response : Response) : Nil
+    if partial = response.partial_message
+      content = partial.content
+      has_content = (content && !content.empty?) || partial.has_tool_calls?
+      @history.lock { |h| h << partial } if has_content
+    end
     trim_history!
     response.finish_with_error(CancelledError.new)
   end
@@ -541,7 +691,7 @@ class Agent
     end
 
     if max_iter && iteration > max_iter
-      err_msg = "Agent error: tool call iteration limit (#{max_iter}) exceeded"
+      err_msg = "tool call iteration limit (#{max_iter}) exceeded"
       response.finish_with_error(ToolLoopError.new(max_iter, err_msg))
       return true
     end
@@ -786,196 +936,242 @@ class Agent
     end
   end
 
-  # Perform the HTTP POST to the provider and parse the streaming response.
-  # This is a thin shim that delegates to the provider for wire-format concerns.
-  #
-  # Per-read SSE timeouts (first-byte vs idle) come from `Agent::Config` and
-  # are applied both to the HTTP client (so the underlying socket honours them)
-  # and threaded through to `Provider#parse_stream` (which can re-apply per
-  # read). `IO::TimeoutError` and `IdleTimeoutError` are caught here and surface
-  # as `Agent::IdleTimeoutError` via the response's error path, mirroring the
-  # `CancelledError` recovery (rebuild the connection, keep the partial msg).
+  # Run one turn through retries and fallback runtimes. Providers build and
+  # parse exactly one attempt; this loop owns retry/fallback/finalization.
   private def http_post_stream(
     messages : Array(Message),
     tools : Array(Tool)?,
     response : Response,
+    options : RequestOptions,
   ) : {Message, Usage, String?}
     @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
-      all_tools = combined_tools(ctx.tools)
-      req = @provider.build_request(ctx.messages, all_tools)
-
-      first_byte_timeout, idle_timeout = apply_request_timeouts(req[:body].bytesize)
-      client = @http_client
-      partial_msg = nil
-
-      begin
-        client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
-          unless http_resp.status.ok?
-            raise ApiError.new(http_resp.status_code, "#{http_resp.status_code} #{http_resp.status_message}")
-          end
-
-          msg, usage, finish_reason = @provider.parse_stream(
-            http_resp.body_io,
-            response,
-            -> { response.cancelled? },
-            first_byte_timeout: first_byte_timeout,
-            idle_timeout: idle_timeout,
-          )
-
-          # If the response was cancelled mid-stream, treat it as an error.
-          # Keep the partial assistant message so the caller can preserve it
-          # in history, and raise to abort the HTTP block.
-          if response.cancelled?
-            partial_msg = msg
-            raise CancelledError.new
-          end
-
-          {msg, usage, finish_reason}
-        end
-      rescue ex
-        handle_post_error(ex, response, partial_msg, first_byte_timeout, idle_timeout)
-      end
+      perform_turn(ctx, response, options)
     end
+  rescue ex
+    err = normalize_error(ex, response)
+    response.finish_with_error(err) unless response.finished?
+    error_tuple(err)
   end
 
-  # Centralised error handler for #http_post_stream. Dispatches on the
-  # exception type, decorates it through the handler chain, calls
-  # `response.finish_with_error`, and returns the canonical error tuple to the
-  # caller (preserving any partial assistant message captured before the
-  # failure). Active connections are rebuilt after cancellation / timeout /
-  # mid-line read failures because the socket may be in an unknown state.
-  private def handle_post_error(
-    ex : Exception,
+  # The turn body runs as a normal method so retry/fallback can use `return`
+  # without returning from the captured handler block.
+  private def perform_turn(
+    ctx : TurnContext,
     response : Response,
-    partial_msg : Message?,
-    first_byte_timeout : Time::Span?,
-    idle_timeout : Time::Span,
+    options : RequestOptions,
   ) : {Message, Usage, String?}
-    case ex
-    when ApiError
-      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-      response.finish_with_error(err)
-      error_tuple(err)
-    when CancelledError, IdleTimeoutError
-      # Cancellation / per-read SSE timeout was already wrapped by the parser
-      # for the idle case, or raised here directly for cancellation. Either
-      # leaves the persistent HTTP connection with an unconsumed/partial
-      # response body, which would corrupt the next request on the same client
-      # ("Invalid HTTP response"). Discard and build a fresh one.
-      rebuild_http_client
-      err = @handlers.decorate(ErrorContext.new(ex)) { |c| c.error.as(Agent::Error) }
-      response.finish_with_error(err)
-      error_tuple(err, partial_msg)
-    when IO::TimeoutError
-      # Defensive fallback: the parser wraps its IO reads and raises
-      # IdleTimeoutError directly, but other IO operations in this shim (eg.
-      # request body upload) might still raise IO::TimeoutError. Recover the
-      # same way as IdleTimeoutError with phase inferred from partial_msg.
-      rebuild_http_client
-      phase = partial_msg.nil? ? :first_byte : :idle
-      err = @handlers.decorate(ErrorContext.new(ex)) do |c|
-        IdleTimeoutError.new(phase, first_byte_timeout || idle_timeout, cause: c.error)
+    all_tools = combined_tools(ctx.tools)
+    last : AttemptOutcome? = nil
+    attempt_index = 0
+    delay_before : Time::Span? = nil
+
+    @runtimes.each do |runtime|
+      max_retries = options.max_retries || runtime.config.max_retries
+      retries = 0
+
+      loop do
+        return finalize_cancelled(response, last) if response.cancelled?
+        return finalize_closed(response, last) if closed?
+
+        effective = runtime.config.request_options.merge(options)
+        attempt_index += 1
+        outcome = perform_attempt(runtime, ctx.messages, all_tools, effective,
+          response, attempt_index, delay_before)
+        delay_before = nil
+        last = outcome
+        response.record_attempt(outcome.attempt)
+
+        if result = outcome.result
+          return result
+        end
+        return finalize_cancelled(response, outcome) if response.cancelled?
+        return finalize_closed(response, outcome) if closed?
+        # Never retry or fall back after output reached the caller.
+        return finalize_error(response, outcome) if outcome.output_started?
+
+        if error = outcome.error
+          if !error.fatal? && runtime.config.retry_policy.retryable?(error) && retries < max_retries
+            retries += 1
+            delay = runtime.config.retry_policy.delay_for(retries, error)
+            unless runtime.config.retry_policy.await(delay, response, @shutdown_channel)
+              return response.cancelled? ? finalize_cancelled(response, outcome) : finalize_closed(response, outcome)
+            end
+            delay_before = delay
+            next
+          end
+        end
+        break
       end
-      response.finish_with_error(err)
-      error_tuple(err, partial_msg)
-    else
-      err = @handlers.decorate(ErrorContext.new(ex)) do |c|
-        ConnectionError.new(c.error.message || c.error.class.name, cause: c.error)
+
+      break if last.try(&.error.try(&.fatal?))
+    end
+
+    finalize_error(response, last)
+  end
+
+  private def perform_attempt(
+    runtime : ProviderRuntime,
+    messages : Array(Message),
+    tools : Array(Tool)?,
+    options : RequestOptions,
+    response : Response,
+    index : Int32,
+    delay_before : Time::Span?,
+  ) : AttemptOutcome
+    started = monotonic_now
+    provider_name = runtime.provider.name
+    model = runtime.config.model
+
+    begin
+      request = runtime.provider.build_request(messages, tools, options)
+      first_byte_timeout, idle_timeout = runtime.prepare(request[:body].bytesize)
+
+      result = runtime.client.post(request[:path], headers: request[:headers], body: request[:body]) do |http_resp|
+        response.request_id = request_id_from(http_resp.headers)
+
+        unless http_resp.status.ok?
+          body = ErrorFactory.read_body(http_resp.body_io)
+          raise ErrorFactory.api_error(
+            http_resp.status_code, http_resp.status_message || "", http_resp.headers, body
+          )
+        end
+
+        if content_type = http_resp.headers["Content-Type"]?
+          unless content_type.includes?("text/event-stream")
+            body = ErrorFactory.read_body(http_resp.body_io)
+            if body.lstrip.starts_with?("{")
+              raise ErrorFactory.api_error(
+                http_resp.status_code, http_resp.status_message || "", http_resp.headers, body
+              )
+            else
+              raise StreamError.new("expected text/event-stream, got #{content_type}")
+            end
+          end
+        end
+
+        msg, usage, finish_reason = runtime.provider.parse_stream(
+          http_resp.body_io,
+          response,
+          -> { response.cancelled? },
+          first_byte_timeout: first_byte_timeout,
+          idle_timeout: idle_timeout,
+        )
+
+        if response.cancelled?
+          response.partial_message = msg
+          raise CancelledError.new
+        end
+
+        {msg, usage, finish_reason}
       end
-      response.finish_with_error(err)
-      error_tuple(err)
+
+      AttemptOutcome.new(result, nil, Response::Attempt.new(
+        index: index,
+        provider: provider_name,
+        model: model,
+        status_code: 200,
+        request_id: response.request_id,
+        duration: monotonic_now - started,
+        delay_before: delay_before,
+        output_started: response.output_started?,
+      ))
+    rescue ex
+      error = normalize_error(ex, response)
+      rebuild_runtime_after_error(runtime, error)
+      status = error.is_a?(ApiError) ? error.status_code : nil
+      request_id = (error.is_a?(ApiError) ? error.request_id : nil) || response.request_id
+      retry_after = error.is_a?(ApiError) ? error.retry_after : nil
+
+      AttemptOutcome.new(nil, error, Response::Attempt.new(
+        index: index,
+        provider: provider_name,
+        model: model,
+        status_code: status,
+        error: error,
+        request_id: request_id,
+        retry_after: retry_after,
+        duration: monotonic_now - started,
+        delay_before: delay_before,
+        output_started: response.output_started?,
+      ))
     end
   end
 
-  # Compute the per-request SSE read timeouts from `Agent::Config` and apply
-  # them to the persistent HTTP client. Returns the {first_byte, idle} timeouts
-  # to thread through to the provider's `#parse_stream`.
-  #
-  # `prompt_bytes` is the size of the wire-format request body; the first-byte
-  # budget scales with prompt size per AGENTS.md. When dynamic first-byte is
-  # disabled (`compute_first_byte_timeout? == false`), `first_byte` is nil and
-  # both reads fall back to `idle_byte_timeout`.
-  #
-  # The HTTP client's `read_timeout` is set to `Config#effective_read_timeout`
-  # (the smaller of first_byte_timeout and idle_byte_timeout on a real
-  # connection), because HTTP::Client only honours `read_timeout` at
-  # socket-open time — there's no portable way to mutate the per-read timeout
-  # mid-stream on `http_resp.body_io`. The provider's `parse_stream` re-applies
-  # per-read timeouts on the body_io when it supports `read_timeout=` (a no-op
-  # for HTTP::ChunkedContent) so the first-byte-generous-then-idle-tight
-  # switch is honored on IOs that surface the setter.
-  #
-  # Also: rebuild the client when the desired value changes so the new value
-  # sticks on a fresh socket (pooled connections don't pick up a new
-  # `client.read_timeout` after open).
-  private def apply_request_timeouts(prompt_bytes : Int) : {Time::Span?, Time::Span}
-    first_byte_timeout = @config.compute_first_byte_timeout(prompt_bytes)
-    idle_timeout = @config.idle_byte_timeout
-    desired_rt = @config.effective_read_timeout(prompt_bytes)
-    if desired_rt && desired_rt != @applied_read_timeout
-      apply_client_read_timeout(desired_rt)
+  private def finalize_cancelled(response : Response, outcome : AttemptOutcome?) : {Message, Usage, String?}
+    error : Agent::Error = outcome.try(&.error) || CancelledError.new
+    error = CancelledError.new unless error.is_a?(CancelledError)
+    response.finish_with_error(error)
+    error_tuple(error, response.partial_message)
+  end
+
+  private def finalize_closed(response : Response, outcome : AttemptOutcome?) : {Message, Usage, String?}
+    error = Agent::Error.new("Agent was closed")
+    response.finish_with_error(error)
+    error_tuple(error, response.partial_message)
+  end
+
+  private def finalize_error(response : Response, outcome : AttemptOutcome?) : {Message, Usage, String?}
+    error = outcome.try(&.error) || Agent::Error.new("Agent request failed")
+    decorated = begin
+      @handlers.decorate(ErrorContext.new(error)) { |ctx| ctx.error.as(Agent::Error) }
+    rescue
+      error
     end
-    {first_byte_timeout, idle_timeout}
+    response.finish_with_error(decorated)
+    error_tuple(decorated, response.partial_message)
+  end
+
+  private def normalize_error(ex : Exception, response : Response) : Agent::Error
+    case ex
+    when Agent::Error
+      ex
+    when IO::TimeoutError
+      phase = response.output_started? ? :idle : :first_byte
+      IdleTimeoutError.new(phase, @config.idle_byte_timeout, cause: ex)
+    when ArgumentError
+      ConfigurationError.new(ex.message || ex.class.name, cause: ex)
+    when IO::Error
+      ConnectionError.new(ex.message || ex.class.name, cause: ex)
+    else
+      ConnectionError.new(ex.message || ex.class.name, cause: ex)
+    end
+  end
+
+  private def rebuild_runtime_after_error(runtime : ProviderRuntime, error : Agent::Error) : Nil
+    case error
+    when ConfigurationError, UnsupportedCapabilityError
+      return
+    when ApiError
+      return unless error.retryable?
+    end
+    runtime.rebuild_client
+  end
+
+  private def request_id_from(headers : HTTP::Headers) : String?
+    headers["x-request-id"]? || headers["request-id"]? || headers["openai-request-id"]?
+  end
+
+  private def closed? : Bool
+    @state_mutex.synchronize { @closed }
+  end
+
+  # Time.monotonic is deprecated in Crystal 1.22+; Time.instant does not exist
+  # on older supported compilers.
+  private def monotonic_now
+    {% if compare_versions(Crystal::VERSION, "1.22.0") >= 0 %}
+      Time.instant
+    {% else %}
+      Time.monotonic
+    {% end %}
   end
 
   # Build the canonical error return tuple for #http_post_stream: an assistant
   # message whose content is the prefix-decorated error message, plus empty
   # usage and nil finish_reason. If `partial` is provided (e.g. a partial
-  # assistant message captured before cancellation / timeout), it is
-  # preserved so the caller can keep any streamed tokens in history.
+  # assistant message captured before cancellation), it is preserved so the
+  # caller can keep any streamed tokens in history.
   private def error_tuple(err : Agent::Error, partial : Message? = nil) : {Message, Usage, String?}
     msg = partial || Message.new(role: Role::Assistant, content: "Agent error: #{err.message || err.class.name}")
     {msg, Usage.new, nil}
-  end
-
-  private def build_http_client : HTTP::Client
-    uri = @provider.base_uri
-    client = HTTP::Client.new(uri)
-
-    # The legacy read_timeout from config (defaults to nil). When callers do
-    # not set it explicitly, it remains nil and the dynamic per-read SSE
-    # timeouts (set in #http_post_stream via #apply_client_read_timeout) take
-    # over. If both are set, apply_client_read_timeout overrides this on the
-    # first request whose dynamic timeout differs.
-    if (rt = @config.read_timeout) && rt > Time::Span.zero
-      client.read_timeout = rt
-      @applied_read_timeout = rt
-    else
-      @applied_read_timeout = nil
-    end
-    if (ct = @config.connect_timeout) && ct > Time::Span.zero
-      client.connect_timeout = ct
-    end
-
-    client
-  end
-
-  # Apply a per-read timeout to the persistent HTTP client. Because the
-  # underlying socket only honours `read_timeout` at open time, a value change
-  # requires rebuilding the client so the next POST opens a fresh socket with
-  # the new budget. The parser (StreamParser.parse) additionally re-applies
-  # `read_timeout=` to the body_io per successful read on IOs that support it
-  # (true sockets); this handles the first-byte → idle timeout switch.
-  private def apply_client_read_timeout(timeout : Time::Span) : Nil
-    return unless timeout > Time::Span.zero
-    @http_client.read_timeout = timeout
-    # If the timeout differs from what was applied at socket open, rebuild so
-    # the new value sticks on a fresh connection.
-    if timeout != @applied_read_timeout
-      rebuild_http_client
-      @http_client.read_timeout = timeout
-      @applied_read_timeout = timeout
-    end
-  end
-
-  # Replace the persistent HTTP client with a fresh one.
-  # Used after a cancelled stream leaves the previous connection with an
-  # unconsumed response body, which would corrupt the next request.
-  private def rebuild_http_client : Nil
-    @http_client.close
-  rescue IO::Error
-    # ignore close errors on a possibly-broken socket
-  ensure
-    @http_client = build_http_client
   end
 end

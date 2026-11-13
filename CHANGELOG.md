@@ -1,6 +1,45 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-11-12
+
+### Added
+
+- Named provider presets: `openai`, `deepseek`, `openrouter`, `groq`,
+  `together`, `ollama`, `vllm`, and `custom`, with endpoint inference,
+  capability flags, per-model overrides, and env-key resolution that never
+  leaks `OPENAI_API_KEY` to a custom host.
+- `Agent::RequestOptions` with modern Chat Completions parameters:
+  `max_completion_tokens`, `response_format`, `tool_choice`,
+  `parallel_tool_calls`, `reasoning_effort`, `verbosity`, `thinking`,
+  `service_tier`, `store`, `metadata`, `seed`, `stop`, penalties,
+  `prompt_cache_key`, `include`, `extra_body`, `extra_headers`, and
+  per-request `max_retries`. Global defaults live in
+  `Config#request_options`; `#ask` accepts per-request overrides.
+- OpenAI Responses API provider (`api_style: :responses`) with SSE event
+  parsing, `function_call` / `function_call_output` conversion, usage mapping,
+  and `Message#provider_data` replay for reasoning/tool items.
+- Reliability layer: exponential backoff, jitter, `Retry-After` /
+  `Retry-After-Ms` parsing, `x-should-retry`, status-specific `ApiError`
+  subclasses, error-body/request-id parsing, and cross-provider fallback.
+- `Response#attempts`, `#request_id`, `#output_started?`, and
+  `#partial_message` diagnostics.
+- DeepSeek support: `deepseek-flash` default, `thinking` controls,
+  `reasoning_content` round-trip in tool conversations, `max_tokens` mapping,
+  and Chat `json_schema` rejection.
+- Tests for presets, request bodies, error parsing, retries, fallback,
+  cancellation during backoff, history rollback, and the Responses API.
+- `LICENSE` file (MIT).
+
+### Changed
+
+- `Agent::Config` is the single user-facing config; `Provider::OpenAI::Config`
+  is now an alias.
+- Provider requests are built through a capability-aware `RequestBody` and
+  auth/path/query handling, including `api_path` and `query_params` overrides.
+- `Message#to_request_body` can round-trip `reasoning_content`; `Tool` supports
+  `strict` and Chat/Responses serializers.
+- Default retries are 2; set `max_retries: 0` to disable. Retries/fallback
+  stop permanently once any output chunk has been produced.
 
 ### Fixed
 
@@ -10,6 +49,17 @@
   leaf returns the pre-built error message). Previously these two paths built
   the error message directly, bypassing `ChainHandler#decorate`, so
   handler-based tracing never observed the failed call.
+- History rollback on a failed later tool-loop iteration now truncates to the
+  start-of-request snapshot instead of popping the newest tool/assistant
+  messages.
+- Cancellation during retry backoff no longer appends a synthetic
+  `"Agent error"` assistant message to history.
+- Error messages no longer double-prefix `"Agent error:"` for
+  `IdleTimeoutError`/`ToolLoopError`.
+- Build-time errors (unsupported options or raising handlers) are converted
+  into response errors instead of killing the agent fiber.
+- SSE parsing now consumes the chunked-body terminator after `[DONE]`,
+  preventing keep-alive corruption on the next request.
 
 ## [0.2.0] - 2026-10-19
 

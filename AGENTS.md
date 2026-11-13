@@ -15,21 +15,29 @@ src/
   agent.cr              # entry point, requires sub-files
   agent/
     version.cr           # VERSION constant
-    config.cr            # Agent::Config — generic fields (system_prompt, max_history, timeouts)
-    error.cr             # Agent::Error hierarchy
+    config.cr            # Agent::Config — provider presets, options, retries, fallbacks
+    error.cr             # Agent::Error hierarchy (API/stream/capability errors)
+    error_factory.cr     # HTTP/SSE error payload parsing, Retry-After
+    request_options.cr   # RequestOptions, ResponseFormat, ToolChoice
+    retry_policy.cr      # exponential backoff, Retry-After, cancellable await
     json_converter.cr    # JSONConverter helper for tool param schemas
     message.cr           # Agent::Message, ContentPart, ToolCall, Usage
-    response.cr          # Agent::Response — async handle with stream/join/finished
-    tool.cr              # Agent::Tool / FunctionDef (extracted from agent.cr)
-    agent.cr             # Agent — fiber loop, history, tool resolution (no HTTP/SSE code)
+    response.cr          # Agent::Response — async handle, attempts, cancel signal
+    tool.cr              # Agent::Tool / FunctionDef + wire serializers
+    agent.cr             # Agent — fiber loop, runtimes, retry/fallback, tool resolution
     provider.cr          # requires provider/ modules
     provider/
       base.cr            # Agent::Provider::Base — abstract interface
+      preset.cr          # Capabilities, Preset, Presets registry/inference
       openai/
-        openai.cr        # entry point, requires sub-files
-        config.cr        # Provider::OpenAI < Base + OpenAI::Config
-        request_body.cr  # OpenAI wire-format request builder
-        stream_parser.cr # SSE parser, delta accumulation, usage parsing
+        openai.cr        # generic OpenAI-compatible Chat Completions engine
+        config.cr        # alias Config = Agent::Config
+        request_body.cr  # Chat Completions request builder
+        stream_parser.cr # Chat SSE parser, delta/usage/error handling
+      responses/
+        responses.cr     # OpenAI Responses API provider
+        request_body.cr  # canonical history -> Responses input/items
+        stream_parser.cr # Responses SSE event parser
 ```
 
 ### Provider separation
@@ -104,13 +112,18 @@ chunks, wait for the message, or do other work.
 ### Provider separation
 
 All wire-format concerns live in `Agent::Provider::Base` implementations.
-The `http_post_stream` shim in `agent.cr` is provider-agnostic:
+`Agent` owns one `ProviderRuntime` per endpoint (primary + fallbacks), each
+with its own provider, `HTTP::Client`, and resolved `Agent::Config`.
+`perform_attempt` calls the provider once; `perform_turn` owns retries,
+fallback, and finalization:
 
 ```crystal
-req = @provider.build_request(messages, tools)
-client.post(req[:path], headers: req[:headers], body: req[:body]) do |http_resp|
-  msg, usage, finish_reason = @provider.parse_stream(
-    http_resp.body_io, response, ->{ response.cancelled? }
+request = runtime.provider.build_request(messages, tools, options)
+first_byte, idle = runtime.prepare(request[:body].bytesize)
+result = runtime.client.post(request[:path], headers: request[:headers], body: request[:body]) do |http_resp|
+  msg, usage, finish_reason = runtime.provider.parse_stream(
+    http_resp.body_io, response, ->{ response.cancelled? },
+    first_byte_timeout: first_byte, idle_timeout: idle
   )
   raise CancelledError.new if response.cancelled?
   {msg, usage, finish_reason}
@@ -118,8 +131,31 @@ end
 ```
 
 Auth headers, request body shape, SSE parsing, and final message assembly are
-all owned by the provider. To support a non-OpenAI API, implement `Base` and
-pass it to `Agent.new(config, provider: MyProvider.new(...))`.
+owned by the provider. To support a non-OpenAI wire format, implement `Base`
+and pass it to `Agent.new(config, provider: MyProvider.new(...))`. Legacy
+2-arg `build_request` implementations keep compiling; the 3-arg overload
+ignores `RequestOptions` for them.
+
+### Retries, fallback, and output gating
+
+- `perform_attempt` builds/posts/parses exactly one attempt. It never calls
+  `finish`/`finish_with_error`.
+- `perform_turn` retries retryable errors within a runtime, then moves to the
+  next fallback config for any non-fatal error.
+- `Response#push_chunk` sets `output_started?` *before* the `@streaming`
+  check. Once true, no retry or fallback is permitted.
+- Backoff waits select on `response.cancel_signal` and `@shutdown_channel`,
+  so cancellation/close interrupt a long `Retry-After`.
+- `Response#finish_with_error` is called exactly once, after all runtimes are
+  exhausted. Interim failures never touch the error handler chain.
+
+### History rollback
+
+`process_request_loop` records `start_size` before appending the new user
+messages. On a terminal error it truncates history to `start_size`; do not
+pop `request.new_messages` (after a tool-loop iteration the newest entries are
+tool/assistant messages, not the original user messages). Cancellation uses
+`Response#partial_message` and appends only real streamed content.
 
 ### Buffered chunk channel
 
@@ -211,23 +247,32 @@ reader waits until EOF/connection close).
 
 ### Error handling
 
-All errors produced by the agent use a consistent prefix `"Agent error: ..."`
-so callers can pattern-match programmatically.
+`Agent::Error#message` is raw; `Response#finish_with_error` and
+`Agent#error_tuple` add the single `"Agent error: ..."` prefix seen by
+callers. Do not embed the prefix in error classes.
 
-If `http_post_stream` raises (network error, non-200 status, JSON parse
-failure), the error is caught in `http_post_stream`'s own rescue block, which
-calls `response.finish_with_error` with an `Agent::Error`. This ensures
-`#message` and `#join` always unblock. A `CancelledError` is raised when
-the caller calls `#cancel` on the response — the HTTP fiber checks the
-cancel channel after each SSE line and aborts cleanly, calling
-`finish_with_error(CancelledError.new)`.
+- `ApiError` and its status-specific subclasses carry status, body,
+  request-id, `Retry-After`, API error type/code/param, and the
+  `x-should-retry` override.
+- `ErrorFactory` parses standard OpenAI error JSON, plain text, nested/string
+  errors, and numeric codes; body reads are capped at 64 KB.
+- `ConnectionError`, first-byte `IdleTimeoutError`, 408/409/429/>=500, and
+  transient `StreamError`s are retryable. `ConfigurationError` is fatal.
+  `UnsupportedCapabilityError` is non-fatal and eligible for fallback.
+- `perform_attempt` captures errors; `perform_turn` retries/falls back; only
+  the final outcome calls `finish_with_error`. Cancellation/close during
+  backoff wakes via `Response#cancel_signal` / `@shutdown_channel`.
+- Cancellation preserves only `Response#partial_message` in history;
+  cancellation during backoff must not append a synthetic error message.
+- On terminal failure, `process_request_loop` truncates history to the
+  start-of-request snapshot, not by popping `request.new_messages`.
 
 ## Development workflow
 
 ### Prerequisites
 
 - Crystal >= 1.19 (the library requires the stdlib `sync` module, added in 1.19.0)
-- `OPENAI_API_KEY` environment variable set when running integration tests against a real API.
+- `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` etc. set only when manually smoke-testing a real provider; CI uses local mock servers.
 
 ### Example configuration pattern
 
@@ -364,8 +409,9 @@ flowchart TD
 
 - If any tool call has no registered handler, the loop breaks and returns
   the tool-call message to the caller — same as manual dispatch.
-- If `http_post_stream` raises, the error message is returned and the loop
-  exits (no retry).
+- HTTP failures go through `perform_turn`'s retry/fallback policy. A terminal
+  failure is returned as an error Response; the next tool-loop iteration is
+  not started.
 
 ### Tool argument validation
 
