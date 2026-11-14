@@ -26,6 +26,10 @@
 - DeepSeek support: `deepseek-flash` default, `thinking` controls,
   `reasoning_content` round-trip in tool conversations, `max_tokens` mapping,
   and Chat `json_schema` rejection.
+- `examples/coding_cli.cr`: a minimal terminal coding agent with file/shell
+  tools, approval prompts, streaming, workspace confinement, and resumable
+  sessions; `shards build agent-cli --release` and
+  `scripts/build_macos.sh` produce a packaged macOS binary.
 - Tests for presets, request bodies, error parsing, retries, fallback,
   cancellation during backoff, history rollback, and the Responses API.
 - `LICENSE` file (MIT).

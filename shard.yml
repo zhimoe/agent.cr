@@ -24,3 +24,5 @@ development_dependencies:
 targets:
   ameba:
     main: lib/ameba/bin/ameba.cr
+  agent-cli:
+    main: examples/coding_cli.cr

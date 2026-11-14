@@ -40,6 +40,16 @@ src/
         stream_parser.cr # Responses SSE event parser
 ```
 
+### Coding CLI example
+
+`examples/coding_cli.cr` is an application built on the shard (not part of the
+library API). It registers `list_files`, `read_file`, `search_files`,
+`write_file`, `edit_file`, and `run_command`, confines paths to a workspace,
+prompts through `CodingApprovalHandler`, and saves sessions with
+`Agent#dump`/`#load`. `scripts/build_macos.sh` builds and packages it for the
+current macOS architecture. Keep application-only helpers in the example; do
+not move them into `src/` unless the library truly needs them.
+
 ### Provider separation
 
 All wire-format concerns live in `Provider::Base` implementations. The default `Provider::OpenAI` handles the OpenAI /v1/chat/completions format. The `Agent` core talks only to the abstract interface.

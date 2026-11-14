@@ -724,6 +724,71 @@ agent.load(saved_session_string)
 
 ---
 
+## Coding CLI (macOS)
+
+`examples/coding_cli.cr` is a minimal terminal coding agent built on the shard.
+It provides:
+
+- `list_files`, `read_file`, `search_files`, `write_file`, `edit_file`,
+  `run_command` tools
+- workspace path confinement (including symlink checks)
+- approval prompts for writes and shell commands, with `--auto-approve` and
+  `--read-only` modes
+- streaming output and tool traces
+- resumable sessions (`/save`, `/reset`, `/session`)
+- output truncation and command timeouts
+
+```sh
+# Build a local release binary
+shards build agent-cli --release
+
+# Run it against a provider preset
+bin/agent-cli --workspace . --provider deepseek
+
+# Or against any OpenAI-compatible endpoint
+bin/agent-cli --workspace . \
+  --api-endpoint http://localhost:8080/v1 \
+  --model local-model --api-key x
+```
+
+Important flags:
+
+```text
+--workspace DIR         workspace root (default: current directory)
+--provider NAME         openai, deepseek, openrouter, groq, together, ollama, vllm, custom
+--model NAME            preset default if omitted
+--api-endpoint URL      OpenAI-compatible base URL
+--api-key KEY           prefer LLM_API_KEY / provider env vars
+--api-style STYLE       chat (default) or responses
+--session FILE          default: ~/.agent-cr/<workspace-hash>.json
+--max-history N         default: 40
+--max-tool-iterations N default: 50
+--auto-approve          skip approval prompts
+--read-only             disable write_file, edit_file, run_command
+--show-reasoning        print reasoning deltas
+```
+
+Environment fallbacks: `LLM_PROVIDER`, `LLM_ENDPOINT`, `LLM_MODEL`,
+`LLM_API_KEY`, `AGENT_WORKSPACE`, `AGENT_SESSION`, `AGENT_AUTO_APPROVE`,
+`AGENT_READ_ONLY`, `AGENT_MAX_HISTORY`, `AGENT_MAX_TOOL_ITERATIONS`.
+
+### Package for macOS
+
+```sh
+./scripts/build_macos.sh
+# dist/agent-cli-0.3.0-macos-arm64.tar.gz
+```
+
+The script builds an optimized binary for the current machine architecture,
+ad-hoc signs it when `codesign` is available, and creates a tarball containing
+the binary, README, and LICENSE. It is not notarized; for distribution to other
+Macs, build on the target architecture (or add a universal build in CI) and
+follow normal notarization if needed.
+
+> **Security:** `run_command` executes model-generated shell commands. Keep
+> approval enabled for untrusted models, use `--read-only` when appropriate,
+> and run the CLI inside a container/VM for high-risk repositories.
+
 ## Examples
 
 ### Provider presets and reliability
