@@ -592,11 +592,7 @@ private def default_session_path(workspace : String) : String
 end
 
 private def resolve_real_path(path : String) : String
-  {% if compare_versions(Crystal::VERSION, "1.22.3") >= 0 %}
-    File.realpath(path)
-  {% else %}
-    File.real_path(path)
-  {% end %}
+  File.realpath(path)
 end
 
 # ---------------------------------------------------------------------------

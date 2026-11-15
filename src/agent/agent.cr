@@ -1155,14 +1155,10 @@ class Agent
     @state_mutex.synchronize { @closed }
   end
 
-  # Time.monotonic is deprecated in Crystal 1.22+; Time.instant does not exist
-  # on older supported compilers.
+  # Monotonic clock reading for attempt durations. Time.instant exists on all
+  # supported compilers (the shard requires Crystal >= 1.19).
   private def monotonic_now
-    {% if compare_versions(Crystal::VERSION, "1.22.0") >= 0 %}
-      Time.instant
-    {% else %}
-      Time.monotonic
-    {% end %}
+    Time.instant
   end
 
   # Build the canonical error return tuple for #http_post_stream: an assistant
